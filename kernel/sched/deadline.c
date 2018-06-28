@@ -1206,8 +1206,6 @@ static void update_curr_dl(struct rq *rq)
 		scaled_delta_exec = cap_scale(scaled_delta_exec, scale_cpu);
 	}
 
-	dl_se->runtime -= scaled_delta_exec;
-
 throttle:
 	if (dl_runtime_exceeded(dl_se) || dl_se->dl_yielded) {
 		dl_se->dl_throttled = 1;
