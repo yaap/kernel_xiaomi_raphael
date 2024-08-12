@@ -15,7 +15,6 @@
 #include <linux/kthread.h>
 #include <uapi/linux/sched/types.h>
 #include <linux/slab.h>
-#include <linux/sched/cpufreq.h>
 #include <trace/events/power.h>
 
 #include "sched.h"
@@ -197,9 +196,9 @@ static unsigned int get_next_freq(struct sugov_policy *sg_policy,
 	struct cpufreq_policy *policy = sg_policy->policy;
 	unsigned int freq = arch_scale_freq_invariant() ?
 				policy->cpuinfo.max_freq : policy->cur;
-
 	unsigned int idx, l_freq, h_freq;
-	freq = map_util_freq(util, freq, max);
+
+	freq = (freq + (freq >> 2)) * util / max;
 
 	if (freq == sg_policy->cached_raw_freq && !sg_policy->need_freq_update)
 		return sg_policy->next_freq;
@@ -228,13 +227,13 @@ static void sugov_get_util(unsigned long *util, unsigned long *max, int cpu)
 	unsigned long max_cap;
 	struct rq *rq = cpu_rq(cpu);
 
-	max_cap = arch_scale_cpu_capacity(cpu);
+	max_cap = arch_scale_cpu_capacity(NULL, cpu);
 
 	*util = boosted_cpu_util(cpu);
 	*util = min(*util, max_cap);
 	*max = max_cap;
 #ifdef CONFIG_UCLAMP_TASK
-	*util = uclamp_rq_util_with(rq, apply_dvfs_headroom(*util, cpu, true), NULL);
+	*util = uclamp_util_with(rq, *util, NULL);
 #endif
 }
 

@@ -21,7 +21,7 @@
 #include <linux/slab.h>
 #include <uapi/linux/sched/types.h>
 
-#include "pelt.h"
+#include "walt.h"
 
 struct dl_bandwidth def_dl_bandwidth;
 
@@ -1185,6 +1185,8 @@ static void update_curr_dl(struct rq *rq)
 	curr->se.exec_start = now;
 	cpuacct_charge(curr, delta_exec);
 
+	sched_rt_avg_update(rq, delta_exec);
+
 	/*
 	 * For tasks that participate in GRUB, we implement GRUB-PA: the
 	 * spare reclaimed bandwidth is used to clock down frequency.
@@ -1197,8 +1199,8 @@ static void update_curr_dl(struct rq *rq)
 						 rq,
 						 &curr->dl);
 	} else {
-		unsigned long scale_freq = arch_scale_freq_capacity(cpu);
-		unsigned long scale_cpu = arch_scale_cpu_capacity(cpu);
+		unsigned long scale_freq = arch_scale_freq_capacity(NULL, cpu);
+		unsigned long scale_cpu = arch_scale_cpu_capacity(NULL, cpu);
 
 		scaled_delta_exec = cap_scale(delta_exec, scale_freq);
 		scaled_delta_exec = cap_scale(scaled_delta_exec, scale_cpu);
@@ -1767,9 +1769,6 @@ pick_next_task_dl(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
 
 	queue_push_tasks(rq);
 
-	if (rq->curr->sched_class != &dl_sched_class)
-		update_dl_rq_load_avg(rq_clock_pelt(rq), rq, 0);
-
 	return p;
 }
 
@@ -1777,7 +1776,6 @@ static void put_prev_task_dl(struct rq *rq, struct task_struct *p)
 {
 	update_curr_dl(rq);
 
-	update_dl_rq_load_avg(rq_clock_pelt(rq), rq, 1);
 	if (on_dl_rq(&p->dl) && p->nr_cpus_allowed > 1)
 		enqueue_pushable_dl_task(rq, p);
 }
@@ -1786,7 +1784,6 @@ static void task_tick_dl(struct rq *rq, struct task_struct *p, int queued)
 {
 	update_curr_dl(rq);
 
-	update_dl_rq_load_avg(rq_clock_pelt(rq), rq, 1);
 	/*
 	 * Even when we have runtime, update_curr_dl() might have resulted in us
 	 * not being the leftmost task anymore. In that case NEED_RESCHED will

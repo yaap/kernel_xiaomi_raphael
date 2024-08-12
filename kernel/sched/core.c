@@ -34,7 +34,6 @@
 #include <linux/syscalls.h>
 #include <linux/irq.h>
 #include <linux/delay.h>
-#include <linux/binfmts.h>
 
 #include <linux/kthread.h>
 
@@ -48,8 +47,6 @@
 #include "walt.h"
 #include "../workqueue_internal.h"
 #include "../smpboot.h"
-
-#include "pelt.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
@@ -163,8 +160,9 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
  * In theory, the compile should just see 0 here, and optimize out the call
  * to sched_rt_avg_update. But I don't trust it...
  */
-	s64 __maybe_unused steal = 0, irq_delta = 0;
-
+#if defined(CONFIG_IRQ_TIME_ACCOUNTING) || defined(CONFIG_PARAVIRT_TIME_ACCOUNTING)
+	s64 steal = 0, irq_delta = 0;
+#endif
 #ifdef CONFIG_IRQ_TIME_ACCOUNTING
 	irq_delta = irq_time_read(cpu_of(rq)) - rq->prev_irq_time;
 
@@ -204,11 +202,10 @@ static void update_rq_clock_task(struct rq *rq, s64 delta)
 
 	rq->clock_task += delta;
 
-#ifdef CONFIG_HAVE_SCHED_AVG_IRQ
+#if defined(CONFIG_IRQ_TIME_ACCOUNTING) || defined(CONFIG_PARAVIRT_TIME_ACCOUNTING)
 	if ((irq_delta + steal) && sched_feat(NONTASK_CAPACITY))
-		update_irq_load_avg(rq, irq_delta + steal);
+		sched_rt_avg_update(rq, irq_delta + steal);
 #endif
-	update_rq_clock_pelt(rq, delta);
 }
 
 void update_rq_clock(struct rq *rq)
@@ -524,32 +521,27 @@ void resched_cpu(int cpu)
  */
 int get_nohz_timer_target(void)
 {
-	int i, cpu = smp_processor_id(), default_cpu = -1;
+	int i, cpu = smp_processor_id();
 	struct sched_domain *sd;
 
-	if (is_housekeeping_cpu(cpu)) {
-		if (!idle_cpu(cpu))
-			return cpu;
-		default_cpu = cpu;
-	}
+	if (!idle_cpu(cpu) && is_housekeeping_cpu(cpu))
+		return cpu;
 
 	rcu_read_lock();
 	for_each_domain(cpu, sd) {
-		for_each_cpu_and(i, sched_domain_span(sd),
-			housekeeping_cpumask()) {
+		for_each_cpu(i, sched_domain_span(sd)) {
 			if (cpu == i)
 				continue;
 
-			if (!idle_cpu(i)) {
+			if (!idle_cpu(i) && is_housekeeping_cpu(i)) {
 				cpu = i;
 				goto unlock;
 			}
 		}
 	}
 
-	if (default_cpu == -1)
-		default_cpu = housekeeping_any_cpu();
-	cpu = default_cpu;
+	if (!is_housekeeping_cpu(cpu))
+		cpu = housekeeping_any_cpu();
 unlock:
 	rcu_read_unlock();
 	return cpu;
@@ -739,7 +731,7 @@ int tg_nop(struct task_group *tg, void *data)
 }
 #endif
 
-static void set_load_weight(struct task_struct *p, bool update_load)
+static void set_load_weight(struct task_struct *p)
 {
 	int prio = p->static_prio - MAX_RT_PRIO;
 	struct load_weight *load = &p->se.load;
@@ -750,21 +742,11 @@ static void set_load_weight(struct task_struct *p, bool update_load)
 	if (task_has_idle_policy(p)) {
 		load->weight = scale_load(WEIGHT_IDLEPRIO);
 		load->inv_weight = WMULT_IDLEPRIO;
-		p->se.runnable_weight = load->weight;
 		return;
 	}
 
-	/*
-	 * SCHED_OTHER tasks have to update their load when changing their
-	 * weight
-	 */
-	if (update_load && p->sched_class == &fair_sched_class) {
-		reweight_task(p, prio);
-	} else {
-		load->weight = scale_load(sched_prio_to_weight[prio]);
-		load->inv_weight = sched_prio_to_wmult[prio];
-		p->se.runnable_weight = load->weight;
-	}
+	load->weight = scale_load(sched_prio_to_weight[prio]);
+	load->inv_weight = sched_prio_to_wmult[prio];
 }
 
 #ifdef CONFIG_UCLAMP_TASK
@@ -781,7 +763,7 @@ static void set_load_weight(struct task_struct *p, bool update_load)
 static DEFINE_MUTEX(uclamp_mutex);
 
 /* Max allowed minimum utilization */
-unsigned int sysctl_sched_uclamp_util_min = 128;
+unsigned int sysctl_sched_uclamp_util_min = SCHED_CAPACITY_SCALE;
 
 /* Max allowed maximum utilization */
 unsigned int sysctl_sched_uclamp_util_max = SCHED_CAPACITY_SCALE;
@@ -881,7 +863,7 @@ static inline void uclamp_idle_reset(struct rq *rq, enum uclamp_id clamp_id,
 	if (!(rq->uclamp_flags & UCLAMP_FLAG_IDLE))
 		return;
 
-	uclamp_rq_set(rq, clamp_id, clamp_value);
+	WRITE_ONCE(rq->uclamp[clamp_id].value, clamp_value);
 }
 
 static inline
@@ -1059,8 +1041,8 @@ static inline void uclamp_rq_inc_id(struct rq *rq, struct task_struct *p,
 	if (bucket->tasks == 1 || uc_se->value > bucket->value)
 		bucket->value = uc_se->value;
 
-	if (uc_se->value > uclamp_rq_get(rq, clamp_id))
-		uclamp_rq_set(rq, clamp_id, uc_se->value);
+	if (uc_se->value > READ_ONCE(uc_rq->value))
+		WRITE_ONCE(uc_rq->value, uc_se->value);
 }
 
 /*
@@ -1126,7 +1108,7 @@ static inline void uclamp_rq_dec_id(struct rq *rq, struct task_struct *p,
 	if (likely(bucket->tasks))
 		return;
 
-	rq_clamp = uclamp_rq_get(rq, clamp_id);
+	rq_clamp = READ_ONCE(uc_rq->value);
 	/*
 	 * Defensive programming: this should never happen. If it happens,
 	 * e.g. due to future modification, warn and fixup the expected value.
@@ -1134,7 +1116,7 @@ static inline void uclamp_rq_dec_id(struct rq *rq, struct task_struct *p,
 	SCHED_WARN_ON(bucket->value > rq_clamp);
 	if (bucket->value >= rq_clamp) {
 		bkt_clamp = uclamp_rq_max_value(rq, clamp_id, uc_se->value);
-		uclamp_rq_set(rq, clamp_id, bkt_clamp);
+		WRITE_ONCE(uc_rq->value, bkt_clamp);
 	}
 }
 
@@ -3245,9 +3227,6 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	p->se.vruntime			= 0;
 	p->last_sleep_ts		= 0;
 
-	p->se.vlag			= 0;
-	p->se.slice			= sysctl_sched_base_slice;
-
 	INIT_LIST_HEAD(&p->se.group_node);
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -3446,7 +3425,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 			p->static_prio = NICE_TO_PRIO(0);
 
 		p->prio = p->normal_prio = __normal_prio(p);
-		set_load_weight(p, false);
+		set_load_weight(p);
 
 		/*
 		 * We don't need the reset flag anymore after the fork. It has
@@ -4110,17 +4089,6 @@ unsigned long long task_sched_runtime(struct task_struct *p)
 
 unsigned int capacity_margin_freq = 1280; /* ~20% margin */
 
-DEFINE_PER_CPU(unsigned long, thermal_pressure);
-
-void arch_set_thermal_pressure(struct cpumask *cpus,
-			       unsigned long th_pressure)
-{
-	int cpu;
-
-	for_each_cpu(cpu, cpus)
-		WRITE_ONCE(per_cpu(thermal_pressure, cpu), th_pressure);
-}
-
 /*
  * This function gets called by the timer code, with HZ frequency.
  * We call it with interrupts disabled.
@@ -4136,7 +4104,6 @@ void scheduler_tick(void)
 	u32 old_load;
 	struct related_thread_group *grp;
 	unsigned int flag = 0;
-	unsigned long thermal_pressure;
 
 	sched_clock_tick();
 
@@ -4147,8 +4114,6 @@ void scheduler_tick(void)
 	wallclock = sched_ktime_clock();
 	update_task_ravg(rq->curr, rq, TASK_UPDATE, wallclock, 0);
 	update_rq_clock(rq);
-	thermal_pressure = arch_scale_thermal_pressure(cpu_of(rq));
-	update_thermal_load_avg(rq_clock_thermal(rq), rq, thermal_pressure);
 	curr->sched_class->task_tick(rq, curr, 0);
 	calc_global_load_tick(rq);
 
@@ -5027,22 +4992,22 @@ void set_user_nice(struct task_struct *p, long nice)
 		put_prev_task(rq, p);
 
 	p->static_prio = NICE_TO_PRIO(nice);
-	set_load_weight(p, true);
+	set_load_weight(p);
 	old_prio = p->prio;
 	p->prio = effective_prio(p);
 	delta = p->prio - old_prio;
 
-	if (queued)
+	if (queued) {
 		enqueue_task(rq, p, ENQUEUE_RESTORE | ENQUEUE_NOCLOCK);
+		/*
+		 * If the task increased its priority or is running and
+		 * lowered its priority, then reschedule its CPU:
+		 */
+		if (delta < 0 || (delta > 0 && task_running(rq, p)))
+			resched_curr(rq);
+	}
 	if (running)
 		set_curr_task(rq, p);
-
-	/*
-	 * If the task increased its priority or is running and
-	 * lowered its priority, then reschedule its CPU:
-	 */
-	p->sched_class->prio_changed(rq, p, old_prio);
-
 out_unlock:
 	task_rq_unlock(rq, p, &rf);
 }
@@ -5203,7 +5168,7 @@ static void __setscheduler_params(struct task_struct *p,
 	 */
 	p->rt_priority = attr->sched_priority;
 	p->normal_prio = normal_prio(p);
-	set_load_weight(p, true);
+	set_load_weight(p);
 }
 
 /* Actually do priority change: must hold pi & rq lock. */
@@ -5279,7 +5244,8 @@ recheck:
 			return -EINVAL;
 	}
 
-	if (attr->sched_flags & ~SCHED_FLAG_ALL)
+	if (attr->sched_flags &
+		~(SCHED_FLAG_RESET_ON_FORK | SCHED_FLAG_RECLAIM))
 		return -EINVAL;
 
 	/*
@@ -7630,7 +7596,7 @@ void __init sched_init(void)
 
 	BUG_ON(alloc_related_thread_groups());
 
-	set_load_weight(&init_task, false);
+	set_load_weight(&init_task);
 
 	/*
 	 * The boot idle thread does lazy MMU switching as well:
@@ -8027,9 +7993,15 @@ static int find_capacity_margin_levels(void)
 }
 
 static void sched_update_up_migrate_values(int cap_margin_levels,
-				const struct cpumask *cluster_cpus[])
+			const struct cpumask *cluster_cpus[], bool boosted)
 {
 	int i, cpu;
+	unsigned int *sched_capacity_margin_up_array = boosted ?
+			sched_capacity_margin_up_boosted :
+			sched_capacity_margin_up,
+		     *sysctl_sched_capacity_margin_up_array = boosted ?
+			sysctl_sched_capacity_margin_up_boosted :
+			sysctl_sched_capacity_margin_up;
 
 	if (cap_margin_levels > 1) {
 		/*
@@ -8039,19 +8011,25 @@ static void sched_update_up_migrate_values(int cap_margin_levels,
 		for (i = 0; i < cap_margin_levels; i++)
 			if (cluster_cpus[i])
 				for_each_cpu(cpu, cluster_cpus[i])
-					sched_capacity_margin_up[cpu] =
-					sysctl_sched_capacity_margin_up[i];
+				    sched_capacity_margin_up_array[cpu] =
+				    sysctl_sched_capacity_margin_up_array[i];
 	} else {
 		for_each_possible_cpu(cpu)
-			sched_capacity_margin_up[cpu] =
-				sysctl_sched_capacity_margin_up[0];
+			sched_capacity_margin_up_array[cpu] =
+				sysctl_sched_capacity_margin_up_array[0];
 	}
 }
 
 static void sched_update_down_migrate_values(int cap_margin_levels,
-				const struct cpumask *cluster_cpus[])
+			const struct cpumask *cluster_cpus[], bool boosted)
 {
 	int i, cpu;
+	unsigned int *sched_capacity_margin_down_array = boosted ?
+			sched_capacity_margin_down_boosted :
+			sched_capacity_margin_down,
+		      *sysctl_sched_capacity_margin_down_array = boosted ?
+			sysctl_sched_capacity_margin_down_boosted :
+			sysctl_sched_capacity_margin_down;
 
 	if (cap_margin_levels > 1) {
 		/*
@@ -8060,20 +8038,23 @@ static void sched_update_down_migrate_values(int cap_margin_levels,
 		for (i = 0; i < cap_margin_levels; i++)
 			if (cluster_cpus[i+1])
 				for_each_cpu(cpu, cluster_cpus[i+1])
-					sched_capacity_margin_down[cpu] =
-					sysctl_sched_capacity_margin_down[i];
+				    sched_capacity_margin_down_array[cpu] =
+				    sysctl_sched_capacity_margin_down_array[i];
 	} else {
 		for_each_possible_cpu(cpu)
-			sched_capacity_margin_down[cpu] =
-				sysctl_sched_capacity_margin_down[0];
+			sched_capacity_margin_down_array[cpu] =
+				sysctl_sched_capacity_margin_down_array[0];
 	}
 }
 
 static void sched_update_updown_migrate_values(unsigned int *data,
-					      int cap_margin_levels)
+					    int cap_margin_levels, bool boosted)
 {
 	int i, cpu;
 	static const struct cpumask *cluster_cpus[MAX_CLUSTERS];
+	unsigned int *sysctl_sched_capacity_margin_up_array = boosted ?
+			sysctl_sched_capacity_margin_up_boosted :
+			sysctl_sched_capacity_margin_up;
 
 	for (i = cpu = 0; (!cluster_cpus[i]) &&
 				cpu < num_possible_cpus(); i++) {
@@ -8081,22 +8062,29 @@ static void sched_update_updown_migrate_values(unsigned int *data,
 		cpu += cpumask_weight(topology_core_cpumask(cpu));
 	}
 
-	if (data == &sysctl_sched_capacity_margin_up[0])
-		sched_update_up_migrate_values(cap_margin_levels, cluster_cpus);
+	if (data == &sysctl_sched_capacity_margin_up_array[0])
+		sched_update_up_migrate_values(cap_margin_levels,
+					       cluster_cpus, boosted);
 	else
 		sched_update_down_migrate_values(cap_margin_levels,
-						 cluster_cpus);
+						 cluster_cpus, boosted);
 }
 
-int sched_updown_migrate_handler(struct ctl_table *table, int write,
+static int __sched_updown_migrate_handler(struct ctl_table *table, int write,
 				 void __user *buffer, size_t *lenp,
-				 loff_t *ppos)
+				 loff_t *ppos, bool boosted)
 {
 	int ret, i;
 	unsigned int *data = (unsigned int *)table->data;
 	unsigned int *old_val;
 	static DEFINE_MUTEX(mutex);
 	static int cap_margin_levels = -1;
+	unsigned int *sysctl_sched_capacity_margin_up_array = boosted ?
+			sysctl_sched_capacity_margin_up_boosted :
+			sysctl_sched_capacity_margin_up,
+		     *sysctl_sched_capacity_margin_down_array = boosted ?
+			sysctl_sched_capacity_margin_down_boosted :
+			sysctl_sched_capacity_margin_down;
 
 	mutex_lock(&mutex);
 
@@ -8137,15 +8125,15 @@ int sched_updown_migrate_handler(struct ctl_table *table, int write,
 	}
 
 	for (i = 0; i < cap_margin_levels; i++) {
-		if (sysctl_sched_capacity_margin_up[i] >
-				sysctl_sched_capacity_margin_down[i]) {
+		if (sysctl_sched_capacity_margin_up_array[i] >
+				sysctl_sched_capacity_margin_down_array[i]) {
 			memcpy(data, old_val, table->maxlen);
 			ret = -EINVAL;
 			goto free_old_val;
 		}
 	}
 
-	sched_update_updown_migrate_values(data, cap_margin_levels);
+	sched_update_updown_migrate_values(data, cap_margin_levels, boosted);
 
 free_old_val:
 	kfree(old_val);
@@ -8153,6 +8141,22 @@ unlock_mutex:
 	mutex_unlock(&mutex);
 
 	return ret;
+}
+
+int sched_updown_migrate_handler(struct ctl_table *table, int write,
+				 void __user *buffer, size_t *lenp,
+				 loff_t *ppos)
+{
+	return __sched_updown_migrate_handler(table, write, buffer,
+					      lenp, ppos, false);
+}
+
+int sched_updown_migrate_handler_boosted(struct ctl_table *table, int write,
+				 void __user *buffer, size_t *lenp,
+				 loff_t *ppos)
+{
+	return __sched_updown_migrate_handler(table, write, buffer,
+					      lenp, ppos, true);
 }
 #endif
 
@@ -8179,10 +8183,6 @@ cpu_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 	return &tg->css;
 }
 
-#ifdef CONFIG_UCLAMP_ASSIST
-static void uclamp_set(struct cgroup_subsys_state *css);
-#endif
-
 /* Expose task group only after completing cgroup initialization */
 static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 {
@@ -8199,9 +8199,6 @@ static int cpu_cgroup_css_online(struct cgroup_subsys_state *css)
 	cpu_util_update_eff(css);
 	rcu_read_unlock();
 	mutex_unlock(&uclamp_mutex);
-#ifdef CONFIG_UCLAMP_ASSIST
-	uclamp_set(css);
-#endif
 #endif
 
 	return 0;
@@ -8370,51 +8367,12 @@ capacity_from_percent(char *buf)
 	return req;
 }
 
-#ifdef CONFIG_UCLAMP_ASSIST
-static void cpu_uclamp_write_wrapper(struct cgroup_subsys_state *css, char *buf,
-					enum uclamp_id clamp_id)
-{
-	struct uclamp_request req;
-	struct task_group *tg;
-
-	req = capacity_from_percent(buf);
-	if (req.ret)
-		return;
-
-	static_branch_enable(&sched_uclamp_used);
-
-	mutex_lock(&uclamp_mutex);
-	rcu_read_lock();
-
-        tg = css_tg(css);
-	if (tg->uclamp_req[clamp_id].value != req.util)
-		uclamp_se_set(&tg->uclamp_req[clamp_id], req.util, false);
-
-	/*
-	 * Because of not recoverable conversion rounding we keep track of the
-	 * exact requested value
-	 */
-	tg->uclamp_pct[clamp_id] = req.percent;
-
-	/* Update effective clamps to track the most restrictive value */
-	cpu_util_update_eff(css);
-
-	rcu_read_unlock();
-	mutex_unlock(&uclamp_mutex);
-}
-#endif
-
 static ssize_t cpu_uclamp_write(struct kernfs_open_file *of, char *buf,
 				size_t nbytes, loff_t off,
 				enum uclamp_id clamp_id)
 {
 	struct uclamp_request req;
 	struct task_group *tg;
-
-#ifdef CONFIG_UCLAMP_ASSIST
-	if (task_is_booster(current))
-		return nbytes;
-#endif
 
 	req = capacity_from_percent(buf);
 	if (req.ret)
@@ -8513,50 +8471,6 @@ static u64 cpu_uclamp_ls_read_u64(struct cgroup_subsys_state *css,
 
 	return (u64) tg->latency_sensitive;
 }
-
-#ifdef CONFIG_UCLAMP_ASSIST
-struct uclamp_param {
-	char *name;
-	char uclamp_min[3];
-	char uclamp_max[3];
-	u64  uclamp_latency_sensitive;
-};
-
-static void uclamp_set(struct cgroup_subsys_state *css)
-{
-	int i;
-
-	static struct uclamp_param tgts[] = {
-		{ "top-app",             "50", "max", 1 },
-		{ "foreground",          "0",  "80",  0 },
-		{ "background",          "0",  "50",  0 },
-		{ "system-background",   "0",  "60",  0 },
-		{ "camera-daemon",       "50", "max", 1 },
-		{ "nnapi-hal",           "75", "max", 1 },
-	};
-
-	if (!css->cgroup->kn)
-		return;
-
-	for (i = 0; i < ARRAY_SIZE(tgts); i++) {
-		struct uclamp_param tgt = tgts[i];
-
-		if (!strcmp(css->cgroup->kn->name, tgt.name)) {
-			cpu_uclamp_write_wrapper(css, tgt.uclamp_min,
-						UCLAMP_MIN);
-			cpu_uclamp_write_wrapper(css, tgt.uclamp_max,
-						UCLAMP_MAX);
-			cpu_uclamp_ls_write_u64(css, NULL,
-						tgt.uclamp_latency_sensitive);
-
-			pr_info("uclamp_assist: setting values for %s: uclamp_min=%s uclamp_max=%s uclamp_latency_sensitive=%d\n",
-				tgt.name, tgt.uclamp_min, tgt.uclamp_max,tgt.uclamp_latency_sensitive);
-			return;
-		}
-	}
-}
-#endif /* CONFIG_UCLAMP_ASSIST */
-
 #endif /* CONFIG_UCLAMP_TASK_GROUP */
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
