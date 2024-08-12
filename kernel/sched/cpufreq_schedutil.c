@@ -120,11 +120,7 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 
 static inline bool use_pelt(void)
 {
-#ifdef CONFIG_SCHED_WALT
-	return false;
-#else
 	return true;
-#endif
 }
 
 static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
@@ -387,16 +383,6 @@ unsigned long sugov_effective_cpu_perf(int cpu, unsigned long actual,
 	return max(min, max);
 }
 
-#ifdef CONFIG_SCHED_WALT
-static unsigned long sugov_get_util(struct sugov_cpu *sg_cpu)
-{
-	struct rq *rq = cpu_rq(sg_cpu->cpu);
-
-	sg_cpu->bw_min = cpu_bw_dl(rq);
-
-	return stune_util(sg_cpu->cpu, 0, &sg_cpu->walt_load);
-}
-#else
 static void sugov_get_util(struct sugov_cpu *sg_cpu, unsigned long boost)
 {
 	struct rq *rq = cpu_rq(sg_cpu->cpu);
