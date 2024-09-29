@@ -116,15 +116,6 @@ static bool sugov_should_update_freq(struct sugov_policy *sg_policy, u64 time)
 	return delta_ns >= sg_policy->min_rate_limit_ns;
 }
 
-static inline bool use_pelt(void)
-{
-#ifdef CONFIG_SCHED_WALT
-	return false;
-#else
-	return true;
-#endif
-}
-
 static bool sugov_up_down_rate_limit(struct sugov_policy *sg_policy, u64 time,
 				     unsigned int next_freq)
 {
@@ -182,8 +173,7 @@ static void sugov_deferred_update(struct sugov_policy *sg_policy, u64 time,
 	if (!sugov_update_next_freq(sg_policy, time, next_freq))
 		return;
 
-	if (use_pelt())
-		sg_policy->work_in_progress = true;
+	sg_policy->work_in_progress = true;
 	irq_work_queue(&sg_policy->irq_work);
 }
 
@@ -312,7 +302,6 @@ unsigned long schedutil_cpu_util(int cpu, unsigned long util_cfs,
 		if (!uclamp_is_used() && rt_rq_is_runnable(&rq->rt))
 			*min = max(*min, scale);
 	}
-
 
 	/*
 	 * Because the time spend on RT/DL tasks is visible as 'lost' time to
@@ -526,9 +515,8 @@ static void sugov_update_single(struct update_util_data *hook, u64 time,
 {
 	struct sugov_cpu *sg_cpu = container_of(hook, struct sugov_cpu, update_util);
 	struct sugov_policy *sg_policy = sg_cpu->sg_policy;
-	unsigned long max_cap;
+	unsigned long max_cap, boost;
 	unsigned int next_f;
-	unsigned long boost;
 
 	max_cap = arch_scale_cpu_capacity(sg_cpu->cpu);
 
@@ -616,11 +604,11 @@ static void sugov_work(struct kthread_work *work)
 	/*
 	 * Hold sg_policy->update_lock shortly to handle the case where:
 	 * incase sg_policy->next_freq is read here, and then updated by
-	 * sugov_update_shared just before work_in_progress is set to false
+	 * sugov_deferred_update() just before work_in_progress is set to false
 	 * here, we may miss queueing the new update.
 	 *
 	 * Note: If a work was queued after the update_lock is released,
-	 * sugov_work will just be called again by kthread_work code; and the
+	 * sugov_work() will just be called again by kthread_work code; and the
 	 * request will be proceed before the sugov thread sleeps.
 	 */
 	raw_spin_lock_irqsave(&sg_policy->update_lock, flags);
