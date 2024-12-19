@@ -208,7 +208,6 @@ __maybe_unused static int faccessat_handler_pre(struct kprobe *p,
 	int *mode = (int *)&PT_REGS_PARM3(regs);
 	// Both sys_ and do_ is C function
 	int *flags = (int *)&PT_REGS_CCALL_PARM4(regs);
-
 	return ksu_handle_faccessat(dfd, filename_user, mode, flags);
 }
 
@@ -235,7 +234,6 @@ __maybe_unused static int newfstatat_handler_pre(struct kprobe *p,
 	// int vfs_fstatat(int dfd, const char __user *filename, struct kstat *stat,int flag)
 	int *flags = (int *)&PT_REGS_CCALL_PARM4(regs);
 #endif
-
 	return ksu_handle_stat(dfd, filename_user, flags);
 }
 
@@ -256,7 +254,6 @@ static int execve_handler_pre(struct kprobe *p, struct pt_regs *regs)
 	int *fd = (int *)&PT_REGS_PARM1(regs);
 	struct filename **filename_ptr =
 		(struct filename **)&PT_REGS_PARM2(regs);
-
 	return ksu_handle_execveat_sucompat(fd, filename_ptr, NULL, NULL, NULL);
 }
 
