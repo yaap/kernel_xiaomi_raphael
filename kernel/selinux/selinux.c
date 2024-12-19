@@ -86,7 +86,7 @@ bool getenforce()
 #endif
 }
 
-#if (LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)) &&                         \
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) &&                         \
 	!defined(KSU_COMPAT_HAS_CURRENT_SID)
 /*
  * get the subjective security ID of the current task
@@ -131,7 +131,7 @@ bool is_zygote(void *sec)
 	return result;
 }
 
-#define DEVPTS_DOMAIN "u:object_r:devpts:s0"
+#define DEVPTS_DOMAIN "u:object_r:ksu_file:s0"
 
 u32 ksu_get_devpts_sid()
 {
